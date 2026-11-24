@@ -9,9 +9,19 @@
 const ESC_RE = /[&<>"']/g;
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-/** `text` with & < > " and ' escaped (and nothing else). */
+const escCache = new Map();
+
+/** `text` with & < > " and ' escaped (and nothing else). Short results are cached: template
+ *  variables (titles, urls, dates) are escaped again for every list that shows them. */
 function escapeHtml(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  if (text.length > 48) return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  let out = escCache.get(text);
+  if (out === undefined) {
+    out = text.replace(ESC_RE, (c) => ESCAPES[c]);
+    if (escCache.size > 8192) escCache.clear();
+    escCache.set(text, out);
+  }
+  return out;
 }
 
 const SLUG_MAX = 64;
@@ -60,10 +70,17 @@ function uniqueSlug(slug, taken) {
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+const longDateCache = new Map();
+
 /** A YYYY-MM-DD date in words, from the string alone. */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  let out = longDateCache.get(date);
+  if (out === undefined) {
+    const [y, m, d] = date.split('-');
+    out = `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+    longDateCache.set(date, out);
+  }
+  return out;
 }
 
 /** Whether `code` is one of JavaScript's whitespace characters (what \s matches). */
@@ -75,16 +92,17 @@ function isJSWS(code) {
   );
 }
 
+/** Whitespace lookup for the ASCII range (exactly the characters \s matches there). */
+const WS_TABLE = new Uint8Array(128);
+for (let c = 0; c < 128; c++) WS_TABLE[c] = isJSWS(c) ? 1 : 0;
+
 /** The number of words in `text`: its runs of characters other than whitespace. */
 function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
-    const ws =
-      code === 32 || code === 9 || code === 10 || code === 11 || code === 12 || code === 13 ||
-      code === 160 || code === 5760 || (code >= 8192 && code <= 8202) || code === 8232 || code === 8233 ||
-      code === 8239 || code === 8287 || code === 12288 || code === 65279;
+    const ws = code < 128 ? WS_TABLE[code] === 1 : isJSWS(code);
     if (ws) inWord = false;
     else if (!inWord) {
       count++;
@@ -279,6 +297,11 @@ function isHR(line) {
 
 /** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
 function endsParagraph(line) {
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  // A blank line starts with a space or tab, a fence with `, a heading with #, a break with - or *;
+  // any other first character settles it at once.
+  if (c0 !== 32 && c0 !== 9 && c0 !== 96 && c0 !== 35 && c0 !== 45 && c0 !== 42) return false;
   return isBlankLine(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
 }
 
@@ -322,7 +345,11 @@ function lex(src) {
       i++;
       continue;
     }
-    const lang = fenceOpen(line);
+    // Each opener test below is guarded by the first character it requires: a fence starts with `,
+    // a heading with #, a break with - or *, a bullet with - or *, an ordered item with a digit —
+    // a test whose character is absent returns null without being called.
+    const c0 = line.charCodeAt(0);
+    const lang = c0 === 96 ? fenceOpen(line) : null;
     if (lang !== null) {
       const body = [];
       i++;
@@ -331,18 +358,18 @@ function lex(src) {
       tokens.push({ type: 'code', lang, lines: body });
       continue;
     }
-    const heading = headingOf(line);
+    const heading = c0 === 35 ? headingOf(line) : null;
     if (heading !== null) {
       tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
       i++;
       continue;
     }
-    if (isHR(line)) {
+    if ((c0 === 45 || c0 === 42) && isHR(line)) {
       tokens.push({ type: 'hr' });
       i++;
       continue;
     }
-    if (line.charCodeAt(0) === 62) {
+    if (c0 === 62) {
       const body = [];
       while (i < lines.length && lines[i].charCodeAt(0) === 62) {
         const raw = lines[i++];
@@ -351,8 +378,8 @@ function lex(src) {
       tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
       continue;
     }
-    const bullet = bulletOf(line);
-    const ordered = bullet === null ? orderedOf(line) : null;
+    const bullet = c0 === 45 || c0 === 42 ? bulletOf(line) : null;
+    const ordered = bullet === null && c0 >= 48 && c0 <= 57 ? orderedOf(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const items = [];
@@ -379,15 +406,37 @@ function lex(src) {
 
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+const ESCAPABLE_T = new Uint8Array(128);
+for (const ch of ESCAPABLE) ESCAPABLE_T[ch.charCodeAt(0)] = 1;
+const isEscapable = (code) => code < 128 && ESCAPABLE_T[code] === 1;
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+/** Inline scan classes for ASCII: 1 = a special that ends a plain run (\\ ` * [), 2 = escapable HTML. */
+const INLINE_KIND = new Uint8Array(128);
+for (const ch of ['\\', '`', '*', '[']) INLINE_KIND[ch.charCodeAt(0)] = 1;
+for (const ch of ['&', '<', '>', '"', "'"]) INLINE_KIND[ch.charCodeAt(0)] = 2;
+
+/** The first ** from `from`, outside a backslash escape, or -1. */
+function findDoubleStar(s, from) {
+  for (let j = from; j + 1 < s.length; j++) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
-    if (s.startsWith(what, j)) return j;
+    if (c === 42 && s.charCodeAt(j + 1) === 42) return j;
+  }
+  return -1;
+}
+
+/** The first ] from `from`, outside a backslash escape, or -1. */
+function findCloseBracket(s, from) {
+  for (let j = from; j < s.length; j++) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
+      j++;
+      continue;
+    }
+    if (c === 93) return j;
   }
   return -1;
 }
@@ -396,7 +445,7 @@ function findUnescaped(s, what, from) {
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
@@ -420,18 +469,25 @@ function inline(s, env) {
   const n = s.length;
   while (i < n) {
     let j = i;
+    let esc = false;
     while (j < n) {
       const c = s.charCodeAt(j);
-      if (c === 92 || c === 96 || c === 42 || c === 91) break;
+      const kind = c < 128 ? INLINE_KIND[c] : 0;
+      if (kind === 1) break;
+      if (kind === 2) esc = true;
       j++;
     }
-    if (j > i) out += escapeHtml(s.slice(i, j));
+    if (j > i) {
+      const run = s.slice(i, j);
+      out += esc ? escapeHtml(run) : run;
+    }
     if (j >= n) break;
     i = j;
     const c = s[i];
     if (c === '\\') {
-      if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-        out += escapeHtml(s[i + 1]);
+      if (i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
+        const e = ESCAPES[s[i + 1]];
+        out += e === undefined ? s[i + 1] : e;
         i += 2;
       } else {
         out += '\\';
@@ -452,7 +508,7 @@ function inline(s, env) {
     }
     if (c === '*') {
       if (s[i + 1] === '*') {
-        const k = findUnescaped(s, '**', i + 2);
+        const k = findDoubleStar(s, i + 2);
         if (k > i + 2) {
           out += `<strong>${inline(s.slice(i + 2, k), env)}</strong>`;
           i = k + 2;
@@ -473,7 +529,7 @@ function inline(s, env) {
       continue;
     }
     // c === '['
-    const k = findUnescaped(s, ']', i + 1);
+    const k = findCloseBracket(s, i + 1);
     const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
     const target = m === -1 ? '' : s.slice(k + 2, m);
     if (target !== '' && !/\s/.test(target)) {
@@ -507,7 +563,9 @@ function renderMarkdown(src, env) {
       }
       case 'code': {
         const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        blocks.push(`<pre><code${cls}>${t.lines.map((l) => `${escapeHtml(l)}\n`).join('')}</code></pre>`);
+        // Escaping distributes over the "\n" joins (no escapable character is or spans one), so
+        // the whole block is escaped in one call instead of a call per line.
+        blocks.push(`<pre><code${cls}>${escapeHtml(t.lines.length === 0 ? '' : `${t.lines.join('\n')}\n`)}</code></pre>`);
         break;
       }
       case 'hr':
@@ -519,7 +577,9 @@ function renderMarkdown(src, env) {
       case 'list': {
         const tag = t.ordered ? 'ol' : 'ul';
         const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        blocks.push(`${open}\n${t.items.map((item) => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>`);
+        let items = '';
+        for (const item of t.items) items += `<li>${inline(item, env)}</li>\n`;
+        blocks.push(`${open}\n${items}</${tag}>`);
         break;
       }
       case 'paragraph': {
@@ -530,7 +590,9 @@ function renderMarkdown(src, env) {
       }
     }
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  let html = '';
+  for (const b of blocks) html += `${b}\n`;
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 /* --------------------------------------------------------------- templates */
@@ -673,13 +735,42 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-/** A for iteration's scope: the element under its name, and `loop` (which wins a clash with that name). */
-function loopScope(name, x, k, length) {
-  const vars = {};
-  vars[name] = x;
-  vars.loop = { index: k + 1, first: k === 0, last: k === length - 1, length };
+/**
+ * A for iteration's scope: the element under its name, and `loop` (which wins a clash with that name).
+ * Scopes are pushed and popped in stack order and rendering is synchronous — nothing reads a scope
+ * after it is popped — so the scope at each stack depth is one pooled object mutated per iteration
+ * instead of two fresh objects. Each pool slot remembers the element name it last held so a loop
+ * with a different name never sees the previous loop's variable.
+ */
+const scopePool = [];
+function loopScope(name, x, k, length, depth) {
+  let slot = scopePool[depth];
+  if (slot === undefined) {
+    slot = { vars: { loop: {} }, name: null };
+    scopePool[depth] = slot;
+  }
+  const vars = slot.vars;
+  if (slot.name !== name) {
+    if (slot.name !== null && slot.name !== 'loop') delete vars[slot.name];
+    slot.name = name;
+  }
+  if (name !== 'loop') vars[name] = x;
+  const loop = vars.loop;
+  loop.index = k + 1;
+  loop.first = k === 0;
+  loop.last = k === length - 1;
+  loop.length = length;
   return vars;
 }
+
+/** Fused helpers for compiled templates: one call per node instead of a lookup/textOf/escape chain. */
+const tplVar = (sc, path) => escapeHtml(textOf(lookup(sc, path)));
+const tplRaw = (sc, path) => textOf(lookup(sc, path));
+const tplTest = (sc, path) => truthy(lookup(sc, path));
+const tplList = (sc, path) => {
+  const v = lookup(sc, path);
+  return Array.isArray(v) ? v : null;
+};
 
 /** `nodes` rendered by walking the tree in scope chain `sc`; `fns` maps template names to callables. */
 function renderWalk(nodes, sc, fns, depth) {
@@ -705,7 +796,7 @@ function renderWalk(nodes, sc, fns, depth) {
         const xs = lookup(sc, n.path);
         if (!Array.isArray(xs)) break;
         for (let k = 0; k < xs.length; k++) {
-          sc.push(loopScope(n.name, xs[k], k, xs.length));
+          sc.push(loopScope(n.name, xs[k], k, xs.length, sc.length));
           out += renderWalk(n.body, sc, fns, depth);
           sc.pop();
         }
@@ -739,14 +830,14 @@ function compileTemplate(nodes) {
           code += `o+=${JSON.stringify(n.text)};`;
           break;
         case 'var':
-          code += `o+=E(T(L(sc,P[${pathIdx(n.path)}])));`;
+          code += `o+=EV(sc,P[${pathIdx(n.path)}]);`;
           break;
         case 'raw':
-          code += `o+=T(L(sc,P[${pathIdx(n.path)}]));`;
+          code += `o+=TV(sc,P[${pathIdx(n.path)}]);`;
           break;
         case 'if': {
           const idx = pathIdx(n.path);
-          code += `if(TR(L(sc,P[${idx}]))!==${n.not}){`;
+          code += `if(TF(sc,P[${idx}])!==${n.not}){`;
           gen(n.then);
           if (n.else !== null) {
             code += '}else{';
@@ -757,7 +848,7 @@ function compileTemplate(nodes) {
         }
         case 'for': {
           const idx = pathIdx(n.path);
-          code += `{const xs=L(sc,P[${idx}]);if(Array.isArray(xs)){const ln=xs.length;for(let k=0;k<ln;k++){sc.push(MK(${JSON.stringify(n.name)},xs[k],k,ln));`;
+          code += `{const xs=LA(sc,P[${idx}]);if(xs!==null){const ln=xs.length;for(let k=0;k<ln;k++){sc.push(MK(${JSON.stringify(n.name)},xs[k],k,ln,sc.length));`;
           gen(n.body);
           code += 'sc.pop();}}}';
           break;
@@ -769,8 +860,9 @@ function compileTemplate(nodes) {
     }
   };
   gen(nodes);
-  const factory = new Function('L', 'T', 'TR', 'E', 'MK', `return function(sc,F,depth){const P=${JSON.stringify(paths)};let o='';${code}return o;};`);
-  return factory(lookup, textOf, truthy, escapeHtml, loopScope);
+  // The path table is built once per template, not once per render: the returned function closes over it.
+  const factory = new Function('MK', 'P', 'EV', 'TV', 'TF', 'LA', 'return function(sc,F,depth){let o=\'\';' + code + 'return o;};');
+  return factory(loopScope, paths, tplVar, tplRaw, tplTest, tplList);
 }
 
 /* ------------------------------------------------------------------ build */
@@ -858,7 +950,7 @@ function build(input) {
   const statics = [];
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -917,13 +1009,18 @@ function build(input) {
   const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    // The cache is nested by directory so a hit needs no key string built: it holds the resolved
+    // href, or null for a broken link (the report names the source, so a broken link is reported
+    // by every source that names it, cache hit or not).
+    let dirCache = linkCache.get(dir);
+    if (dirCache === undefined) {
+      dirCache = new Map();
+      linkCache.set(dir, dirCache);
+    }
     const env = {
       link: (target) => {
-        const cacheKey = `${dir}\n${target}`;
-        // The cache holds the resolved href, or null for a broken link: the report names the
-        // source, so a broken link is reported by every source that names it, cache hit or not.
-        if (linkCache.has(cacheKey)) {
-          const hit = linkCache.get(cacheKey);
+        if (dirCache.has(target)) {
+          const hit = dirCache.get(target);
           if (hit !== null) return hit;
           broken.add(`broken-link ${s.path} -> ${target}`);
           return target;
@@ -939,7 +1036,7 @@ function build(input) {
           if (path !== null && bySource.has(path)) out = `${bySource.get(path).url}${frag}`;
           else if (path !== null && staticPaths.has(path)) out = `${base}/${path}${frag}`;
         }
-        linkCache.set(cacheKey, out);
+        dirCache.set(target, out);
         if (out !== null) return out;
         broken.add(`broken-link ${s.path} -> ${target}`);
         return target;
@@ -963,7 +1060,15 @@ function build(input) {
   const bySlug = new Map();
   const ownTags = (s) => {
     const seen = new Set();
-    return (s.data.tags ?? []).filter((name) => !seen.has(slugify(name)) && seen.add(slugify(name)));
+    const out = [];
+    for (const name of s.data.tags ?? []) {
+      const slug = slugify(name);
+      if (!seen.has(slug)) {
+        seen.add(slug);
+        out.push(name);
+      }
+    }
+    return out;
   };
   for (const p of posts) {
     p.tagRefs = [];
